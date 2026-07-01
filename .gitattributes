@@ -1,0 +1,7 @@
+# Normalize line endings to LF on check-in (cross-platform consistency)
+* text=auto eol=lf
+
+# Explicitly binary — never mangle these
+*.db     binary
+*.db-shm binary
+*.db-wal binary

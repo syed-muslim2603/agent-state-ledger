@@ -1,0 +1,170 @@
+# ============================================================================ #
+#  Agent State Ledger — Docker Compose                                         #
+# ============================================================================ #
+#
+# Brings up the full Agent State Ledger stack:
+#
+#   router    — FastAPI State Router (port 8000)
+#   monitor   — Rich terminal snapshot monitor (optional; logs to stdout)
+#   prometheus — Prometheus metrics scraper (port 9091)
+#
+# Quick start:
+#   docker compose up --build
+#
+# Build the sandbox image separately (no service — launched on demand):
+#   docker compose build sandbox
+# ============================================================================ #
+
+version: "3.9"
+
+# ---- Shared network ---------------------------------------------------------
+networks:
+  asl-internal:
+    driver: bridge
+    # Restrict communication to named services only; agents in sandboxes
+    # use --network none and never join this network.
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+# ---- Named volumes ----------------------------------------------------------
+volumes:
+  snapshot-data:
+    # Persistent volume for the SQLite snapshot database.
+    # In production, mount a high-IOPS block volume here instead.
+  prometheus-data:
+    # Persistent volume for Prometheus TSDB.
+
+# ---- Services ---------------------------------------------------------------
+services:
+
+  # -------------------------------------------------------------------------- #
+  # router — FastAPI State Router                                               #
+  # -------------------------------------------------------------------------- #
+  router:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+    image: agent-state-ledger-router:latest
+    container_name: asl-router
+    restart: unless-stopped
+    networks:
+      - asl-internal
+    ports:
+      # HTTP API
+      - "8000:8000"
+      # Prometheus metrics scrape
+      - "9090:9090"
+    volumes:
+      # Mount the snapshot data volume into the container
+      - snapshot-data:/data
+    environment:
+      # Router
+      ASL_ROUTER_HOST: "0.0.0.0"
+      ASL_ROUTER_PORT: "8000"
+      ASL_ROUTER_WORKERS: "4"
+      # Context budget
+      ASL_CONTEXT_TOKEN_BUDGET: "8192"
+      ASL_CONTEXT_DISCLOSURE_LEVELS: "3"
+      # Snapshot engine
+      ASL_SNAPSHOT_DB_PATH: "/data/snapshots.db"
+      ASL_SNAPSHOT_INTENT_DEVIATION_THRESHOLD: "0.35"
+      ASL_SNAPSHOT_MAX_ROLLBACK_DEPTH: "10"
+      ASL_SNAPSHOT_CHECKPOINT_INTERVAL_SECONDS: "5.0"
+      ASL_SNAPSHOT_COMPRESSION_ENABLED: "true"
+      ASL_SNAPSHOT_RETENTION_DAYS: "7"
+      # Sandbox
+      ASL_SANDBOX_IMAGE: "agent-state-ledger-sandbox:latest"
+      ASL_SANDBOX_MEMORY_LIMIT_MB: "512"
+      ASL_SANDBOX_CPU_LIMIT: "1.0"
+      ASL_SANDBOX_NETWORK_MODE: "none"
+      ASL_SANDBOX_EXECUTION_TIMEOUT_SECONDS: "60"
+      # Observability
+      ASL_LOG_LEVEL: "INFO"
+      ASL_LOG_FORMAT: "json"
+      ASL_METRICS_ENABLED: "true"
+      ASL_METRICS_PORT: "9090"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    # Pass the Docker socket so the router can launch sandbox containers
+    # on the host Docker daemon.  In production, use a dedicated Docker-in-
+    # Docker sidecar or a container orchestration API instead.
+    volumes:
+      - snapshot-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Resource limits matching the router's own configuration
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: "1g"
+        reservations:
+          cpus: "0.5"
+          memory: "256m"
+
+  # -------------------------------------------------------------------------- #
+  # monitor — Snapshot monitor (read-only terminal dashboard)                  #
+  # -------------------------------------------------------------------------- #
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: final
+    image: agent-state-ledger-router:latest
+    container_name: asl-monitor
+    restart: unless-stopped
+    networks:
+      - asl-internal
+    volumes:
+      - snapshot-data:/data:ro   # Read-only access to the snapshot DB
+    environment:
+      ASL_SNAPSHOT_DB_PATH: "/data/snapshots.db"
+      ASL_LOG_LEVEL: "WARNING"
+      ASL_LOG_FORMAT: "console"
+    command: ["python", "-m", "agent_state_ledger.snapshot.monitor"]
+    depends_on:
+      router:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------------- #
+  # sandbox — Pre-built sandbox image (not a running service)                  #
+  # -------------------------------------------------------------------------- #
+  sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+      target: final
+    image: agent-state-ledger-sandbox:latest
+    # This service is not started by `docker compose up` — it only defines
+    # the image build target so `docker compose build sandbox` works.
+    profiles:
+      - build-only
+
+  # -------------------------------------------------------------------------- #
+  # prometheus — Metrics collection                                             #
+  # -------------------------------------------------------------------------- #
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: asl-prometheus
+    restart: unless-stopped
+    networks:
+      - asl-internal
+    ports:
+      - "9091:9090"   # Expose on 9091 to avoid conflict with ASL metrics port
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      router:
+        condition: service_healthy

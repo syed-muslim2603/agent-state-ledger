@@ -1,0 +1,39 @@
+# ============================================================================ #
+#  Agent State Ledger — Prometheus Configuration                               #
+# ============================================================================ #
+#
+# Scrapes metrics from:
+#   - The ASL router's /metrics endpoint (Prometheus client)
+#
+# In production, add additional scrape jobs for:
+#   - Node Exporter (host-level metrics)
+#   - cAdvisor (container-level metrics)
+#   - Alertmanager integration
+# ============================================================================ #
+
+global:
+  scrape_interval:     15s   # Scrape every 15 seconds
+  evaluation_interval: 15s   # Evaluate rules every 15 seconds
+  scrape_timeout:       10s
+
+  # Attach these labels to all time series scraped from this configuration
+  external_labels:
+    monitor: "agent-state-ledger"
+    environment: "production"
+
+# ---- Scrape configurations --------------------------------------------------
+scrape_configs:
+
+  # ASL Router — Prometheus client metrics
+  - job_name: "asl-router"
+    static_configs:
+      - targets: ["router:9090"]
+        labels:
+          service: "state-router"
+    metrics_path: "/metrics"
+    scheme: http
+
+  # Prometheus self-scrape
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
