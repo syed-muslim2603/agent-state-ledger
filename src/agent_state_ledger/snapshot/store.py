@@ -170,9 +170,15 @@ class SnapshotStore:
         Flush pending WAL frames and close the SQLite connection.
 
         Idempotent — safe to call even if ``open`` was never called.
+        The WAL checkpoint is best-effort — if another reader/writer still
+        holds a lock (e.g. a background task being cancelled in tests) the
+        error is logged and suppressed so the connection still closes cleanly.
         """
         if self._conn is not None:
-            await self._conn.execute("PRAGMA wal_checkpoint(FULL);")
+            try:
+                await self._conn.execute("PRAGMA wal_checkpoint(FULL);")
+            except Exception as exc:  # noqa: BLE001
+                await logger.awarning("wal_checkpoint_skipped", error=str(exc))
             await self._conn.close()
             self._conn = None
             await logger.ainfo("snapshot_store_closed")
@@ -255,6 +261,15 @@ class SnapshotStore:
         Also upserts the ``session_metadata`` row to keep lightweight
         aggregate stats current without requiring expensive COUNT queries.
 
+        aiosqlite opens connections in deferred-transaction mode by default.
+        We do NOT issue an explicit ``BEGIN IMMEDIATE`` here because
+        ``executescript`` (used in migrations) commits the implicit transaction
+        and leaves the connection in autocommit mode.  Calling ``BEGIN``
+        again inside that same connection context raises
+        ``OperationalError: cannot start a transaction within a transaction``.
+        Instead we rely on aiosqlite's implicit transaction that begins
+        automatically on the first DML statement and is committed explicitly.
+
         Raises
         ------
         aiosqlite.IntegrityError
@@ -265,40 +280,39 @@ class SnapshotStore:
         conn = self._require_conn()
         created_at_str = record.created_at.isoformat()
 
-        async with conn.execute("BEGIN IMMEDIATE"):
-            await conn.execute(
-                """
-                INSERT INTO snapshots
-                    (snapshot_id, session_id, agent_id, generation,
-                     session_state_json, state_hash, intent_deviation_score,
-                     is_compressed, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.snapshot_id,
-                    record.session_id,
-                    record.agent_id,
-                    record.generation,
-                    record.session_state_json,
-                    record.state_hash,
-                    record.intent_deviation_score,
-                    int(record.is_compressed),
-                    created_at_str,
-                ),
-            )
-            # Upsert session metadata
-            await conn.execute(
-                """
-                INSERT INTO session_metadata (session_id, total_snapshots, last_checkpoint_at, last_state_hash)
-                VALUES (?, 1, ?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET
-                    total_snapshots    = total_snapshots + 1,
-                    last_checkpoint_at = excluded.last_checkpoint_at,
-                    last_state_hash    = excluded.last_state_hash
-                """,
-                (record.session_id, created_at_str, record.state_hash),
-            )
-            await conn.commit()
+        await conn.execute(
+            """
+            INSERT INTO snapshots
+                (snapshot_id, session_id, agent_id, generation,
+                 session_state_json, state_hash, intent_deviation_score,
+                 is_compressed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.snapshot_id,
+                record.session_id,
+                record.agent_id,
+                record.generation,
+                record.session_state_json,
+                record.state_hash,
+                record.intent_deviation_score,
+                int(record.is_compressed),
+                created_at_str,
+            ),
+        )
+        # Upsert session metadata
+        await conn.execute(
+            """
+            INSERT INTO session_metadata (session_id, total_snapshots, last_checkpoint_at, last_state_hash)
+            VALUES (?, 1, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                total_snapshots    = total_snapshots + 1,
+                last_checkpoint_at = excluded.last_checkpoint_at,
+                last_state_hash    = excluded.last_state_hash
+            """,
+            (record.session_id, created_at_str, record.state_hash),
+        )
+        await conn.commit()
 
     async def save_snapshot_from_session(
         self,

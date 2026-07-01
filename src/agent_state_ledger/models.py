@@ -42,9 +42,14 @@ def _utcnow() -> datetime:
 
 def _new_ulid() -> str:
     """Generate a new ULID string for use as a lexicographically sortable ID."""
-    from python_ulid import ULID  # lazy import to keep module load fast
-
-    return str(ULID())
+    try:
+        # python-ulid >= 2.x
+        import ulid  # lazy import to keep module load fast
+        return str(ulid.ULID())
+    except AttributeError:
+        # Fallback: some versions expose it differently
+        import ulid
+        return str(ulid.new())
 
 
 # ============================================================================ #
@@ -201,6 +206,13 @@ class ToolCallOutput(BaseModel):
         default=0.0,
         ge=0.0,
         description="Wall-clock execution time of the tool in milliseconds.",
+    )
+    requested_disclosure_level: DisclosureLevel = Field(
+        default=DisclosureLevel.STANDARD,
+        description=(
+            "Requested progressive disclosure tier for this output.  The router "
+            "may downgrade to a lower tier if the payload exceeds the token budget."
+        ),
     )
     timestamp: datetime = Field(default_factory=_utcnow)
 

@@ -145,7 +145,7 @@ class SnapshotSettings(BaseSettings):
     )
     checkpoint_interval_seconds: float = Field(
         default=5.0,
-        ge=0.5,
+        ge=0.01,
         description=(
             "Minimum wall-clock interval between automatic checkpoints for "
             "a given agent session.  Prevents write amplification under "
